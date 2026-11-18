@@ -43,96 +43,204 @@ public final class BenchmarkMain {
     private BenchmarkMain() {
     }
 
+
     public static void main(String[] args) throws Exception {
-        int configuredWorkers = args.length > 0 ? parsePositiveInt(args[0], "workers") : 1;
-        int[] sizes = args.length > 1 ? parseSizes(args[1]) : new int[]{100, 200, 300, 400, 500};
-        int repetitions = args.length > 2 ? parsePositiveInt(args[2], "repetitions") : 5;
-        Path output = args.length > 3 ? Path.of(args[3]) : Path.of("results", "raw_results.csv");
+        int[] workerConfigurations = args.length > 0
+                ? parseWorkerSlots(args[0])
+                : new int[]{1, 2, 4, 8};
+
+        int[] sizes = args.length > 1
+                ? parseSizes(args[1])
+                : new int[]{100, 200, 300, 400, 500};
+
+        int repetitions = args.length > 2
+                ? parsePositiveInt(args[2], "repetitions")
+                : 5;
+
+        Path output = args.length > 3
+                ? Path.of(args[3])
+                : Path.of("results", "raw_results.csv");
+
+        System.out.println("Distributed matrix multiplication benchmark");
+        System.out.println("Worker configurations: " + Arrays.toString(workerConfigurations));
+        System.out.println("Matrix sizes: " + Arrays.toString(sizes));
+        System.out.println("Measured repetitions: " + repetitions);
+        System.out.println("Output: " + output.toAbsolutePath());
+
+        for (int configuredWorkers : workerConfigurations) {
+            runConfiguration(configuredWorkers, sizes, repetitions, output);
+        }
+
+        System.out.println("\nAll configurations completed.");
+        System.out.println("Raw measurements appended to: " + output.toAbsolutePath());
+    }
+
+
+    private static void runConfiguration(
+            int configuredWorkers,
+            int[] sizes,
+            int repetitions,
+            Path output) throws Exception {
+
+        System.out.println("\n========================================");
+        System.out.println("Running with " + configuredWorkers + " worker slots");
+        System.out.println("========================================");
 
         long contextStart = System.nanoTime();
+
         SparkConf sparkConf = new SparkConf()
                 .setAppName("Distributed-Matrix-Multiplication")
-                .setMaster("local[*]");
+                .setMaster("local[" + configuredWorkers + "]");
+
         JavaSparkContext sparkContext = new JavaSparkContext(sparkConf);
-        double contextStartupMs = nanosToMillis(System.nanoTime() - contextStart);
+
+        double contextStartupMs =
+                nanosToMillis(System.nanoTime() - contextStart);
+
         sparkContext.sc().setLogLevel("WARN");
 
         String master = sparkContext.sc().master();
-        String environment = master.startsWith("local") ? "local" : "cluster_or_remote";
-        SparkTaskMetricsCollector taskMetricsCollector = new SparkTaskMetricsCollector();
+        String environment = master.startsWith("local")
+                ? "local"
+                : "cluster_or_remote";
+
+        SparkTaskMetricsCollector taskMetricsCollector =
+                new SparkTaskMetricsCollector();
+
         sparkContext.sc().addSparkListener(taskMetricsCollector);
 
-        System.out.println("Distributed matrix multiplication benchmark");
         System.out.println("Spark master: " + master);
         System.out.println("Environment: " + environment);
         System.out.println("Configured worker slots: " + configuredWorkers);
-        System.out.println("Matrix sizes: " + Arrays.toString(sizes));
-        System.out.println("Measured repetitions: " + repetitions);
-        System.out.printf("JavaSparkContext startup: %.3f ms (reported separately)%n", contextStartupMs);
+        System.out.printf("Context startup: %.3f ms%n", contextStartupMs);
 
         try (ForkJoinPool pool = new ForkJoinPool(configuredWorkers)) {
+
             for (int n : sizes) {
                 System.out.printf("%nMatrix size: %d x %d%n", n, n);
+
                 int[][] a = MatrixGenerator.generate(n, SEED_A);
                 int[][] b = MatrixGenerator.generate(n, SEED_B);
 
-                int partitions = Math.min(n, Math.max(1, configuredWorkers * 4));
-                int[][] expected = MatrixMultiplier.multiplyLoopReordered(a, b);
+                int partitions = Math.min(
+                        n,
+                        Math.max(1, configuredWorkers * 4)
+                );
 
-                int[][] sequentialWarmup = MatrixMultiplier.multiplyLoopReordered(a, b);
+                int[][] expected =
+                        MatrixMultiplier.multiplyLoopReordered(a, b);
+
+                int[][] sequentialWarmup =
+                        MatrixMultiplier.multiplyLoopReordered(a, b);
+
                 assertEqual(expected, sequentialWarmup, "sequential warm-up");
-                int[][] parallelWarmup = MatrixMultiplier.multiplyParallelLoopReordered(a, b, pool);
+
+                int[][] parallelWarmup =
+                        MatrixMultiplier.multiplyParallelLoopReordered(a, b, pool);
+
                 assertEqual(expected, parallelWarmup, "parallel warm-up");
 
                 taskMetricsCollector.beginAction(partitions);
                 HeapMemory.resetHeapPoolPeaks();
+
                 long distributedWarmupStart = System.nanoTime();
+
                 SparkMatrixMultiplier.DetailedResult distributedWarmup =
-                        SparkMatrixMultiplier.multiplyDetailed(sparkContext, a, b, partitions);
-                double distributedWarmupMs = nanosToMillis(System.nanoTime() - distributedWarmupStart);
+                        SparkMatrixMultiplier.multiplyDetailed(
+                                sparkContext, a, b, partitions
+                        );
+
+                double distributedWarmupMs =
+                        nanosToMillis(System.nanoTime() - distributedWarmupStart);
+
                 taskMetricsCollector.awaitSnapshot(30, TimeUnit.SECONDS);
-                assertEqual(expected, distributedWarmup.matrix(), "Spark warm-up");
+
+                assertEqual(
+                        expected,
+                        distributedWarmup.matrix(),
+                        "Spark warm-up"
+                );
 
                 List<String> rows = new ArrayList<>(repetitions * 3);
+
                 for (int repetition = 1; repetition <= repetitions; repetition++) {
+
                     HeapMemory.resetHeapPoolPeaks();
+
                     long start = System.nanoTime();
-                    int[][] sequentialResult = MatrixMultiplier.multiplyLoopReordered(a, b);
-                    double elapsedMs = nanosToMillis(System.nanoTime() - start);
+
+                    int[][] sequentialResult =
+                            MatrixMultiplier.multiplyLoopReordered(a, b);
+
+                    double elapsedMs =
+                            nanosToMillis(System.nanoTime() - start);
+
                     double memoryMb = HeapMemory.heapPoolPeakSumMb();
-                    assertEqual(expected, sequentialResult, "sequential repetition " + repetition);
+
+                    assertEqual(
+                            expected,
+                            sequentialResult,
+                            "sequential repetition " + repetition
+                    );
+
                     rows.add(csvRow(
                             master, environment,
                             configuredWorkers, partitions, n,
                             "sequential_baseline",
                             repetition, elapsedMs, memoryMb,
-                            null, SparkTaskMetricsCollector.Snapshot.unavailable()
+                            null,
+                            SparkTaskMetricsCollector.Snapshot.unavailable()
                     ));
 
                     HeapMemory.resetHeapPoolPeaks();
+
                     start = System.nanoTime();
-                    int[][] parallelResult = MatrixMultiplier.multiplyParallelLoopReordered(a, b, pool);
+
+                    int[][] parallelResult =
+                            MatrixMultiplier.multiplyParallelLoopReordered(a, b, pool);
+
                     elapsedMs = nanosToMillis(System.nanoTime() - start);
                     memoryMb = HeapMemory.heapPoolPeakSumMb();
-                    assertEqual(expected, parallelResult, "parallel repetition " + repetition);
+
+                    assertEqual(
+                            expected,
+                            parallelResult,
+                            "parallel repetition " + repetition
+                    );
+
                     rows.add(csvRow(
                             master, environment,
                             configuredWorkers, partitions, n,
                             "parallel_fork_join",
                             repetition, elapsedMs, memoryMb,
-                            null, SparkTaskMetricsCollector.Snapshot.unavailable()
+                            null,
+                            SparkTaskMetricsCollector.Snapshot.unavailable()
                     ));
 
                     taskMetricsCollector.beginAction(partitions);
                     HeapMemory.resetHeapPoolPeaks();
+
                     start = System.nanoTime();
+
                     SparkMatrixMultiplier.DetailedResult distributedResult =
-                            SparkMatrixMultiplier.multiplyDetailed(sparkContext, a, b, partitions);
+                            SparkMatrixMultiplier.multiplyDetailed(
+                                    sparkContext, a, b, partitions
+                            );
+
                     elapsedMs = nanosToMillis(System.nanoTime() - start);
                     memoryMb = HeapMemory.heapPoolPeakSumMb();
+
                     SparkTaskMetricsCollector.Snapshot taskMetrics =
-                            taskMetricsCollector.awaitSnapshot(30, TimeUnit.SECONDS);
-                    assertEqual(expected, distributedResult.matrix(), "Spark repetition " + repetition);
+                            taskMetricsCollector.awaitSnapshot(
+                                    30, TimeUnit.SECONDS
+                            );
+
+                    assertEqual(
+                            expected,
+                            distributedResult.matrix(),
+                            "Spark repetition " + repetition
+                    );
+
                     rows.add(csvRow(
                             master, environment,
                             configuredWorkers, partitions, n,
@@ -141,16 +249,36 @@ public final class BenchmarkMain {
                             distributedResult, taskMetrics
                     ));
                 }
+
                 appendCsv(output, rows);
-                System.out.printf("Completed %d repetitions for n=%d. Partitions=%d, Spark warm-up=%.3f ms%n",
-                        repetitions, n, partitions, distributedWarmupMs);
+
+                System.out.printf(
+                        "Completed %d repetitions for n=%d. " +
+                                "Partitions=%d, Spark warm-up=%.3f ms%n",
+                        repetitions, n, partitions, distributedWarmupMs
+                );
             }
+
         } finally {
             sparkContext.sc().removeSparkListener(taskMetricsCollector);
             sparkContext.stop();
         }
 
-        System.out.println("Raw measurements appended to: " + output.toAbsolutePath());
+        System.out.println(
+                "Finished configuration with " + configuredWorkers + " worker slots."
+        );
+    }
+
+
+    private static int[] parseWorkerSlots(String value) {
+        String[] tokens = value.split(",");
+        int[] workers = new int[tokens.length];
+
+        for (int i = 0; i < tokens.length; i++) {
+            workers[i] = parsePositiveInt(tokens[i].trim(), "worker slots");
+        }
+
+        return workers;
     }
 
     private static String csvRow(
